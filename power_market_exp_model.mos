@@ -1,0 +1,228 @@
+model ModelName
+version 0.1
+uses "mmxprs"; !gain access to the Xpress-Optimizer solver
+uses "mmsheet"; !read/write to spreadsheets
+uses "mmsystem"
+
+options noimplicit	!no implicit definitions
+options explterm	!explicitly terminate lines with a semicolon
+
+!optional parameters section
+parameters
+	DATASOURCE = ".\\data\\"; 
+	SUPPLY_SIDE_WORKBOOK 	= "supply_side_data_exp.xlsx";
+	DEMAND_WORKBOOK			= "demand_6periods.xlsx";
+	
+	USE_EMISSION_CAP	= true;!false;!
+	USE_EMISSION_PRICE	= false;!true;!
+	
+	PRINT_STATS			= true;
+end-parameters
+
+setparam("XPRS_loadnames",true);
+setparam("REALFMT", "%1.0f");
+
+forward procedure write_solution_stats(PRINT_ON:boolean)
+
+declarations
+
+	GENERATORS		: 									range;
+	PERIODS			: 									range;
+	
+	DEMAND				: array(PERIODS) of 			real;
+	PERIOD_DURATION		: array(PERIODS) of 			real;
+	GEN_MARG_COST		: array(GENERATORS) of 			real;
+	GEN_MARG_EMISSIONS	: array(GENERATORS) of 			real;
+	GEN_INIT_CAPACITY	: array(GENERATORS)	of			real;
+	GEN_INVCOST			: array(GENERATORS)	of			real;
+	GEN_FLEX			: array(GENERATORS)	of			boolean;
+	GEN_PROFILE			: array(GENERATORS,PERIODS)		of real;
+
+	GEN_TYPE			: array(GENERATORS)	of			string;
+	GEN_FUEL			: array(GENERATORS)	of			string;
+	GEN_NAME			: array(GENERATORS)	of			string;
+	
+
+	CARBON_CAP			: real;
+	CARBON_PRICE		: real;
+	CARBON_PRICE_ACT	: real;
+	
+	POWER_PRICES		: array(PERIODS) of				real;
+	EMISSION_PRICE		: real;
+	TOTAL_EMISSIONS		: real;
+	TOTAL_SYSTEM_COSTS	: real;
+	TOTAL_SYSTEM_FUEL_COSTS	: real;
+	GEN_PROD_SOL		: array(GENERATORS,PERIODS)		of real;
+	
+	gen_prod			: dynamic array(GENERATORS,PERIODS) of 	mpvar;
+	gen_inv				: dynamic array(GENERATORS) 		of 	mpvar;
+	gen_cap				: dynamic array(GENERATORS) 		of 	mpvar;
+		
+
+	GenMaxCapacity	: array(GENERATORS,PERIODS)	of		linctr;
+	DemandBalance	: array(PERIODS) of 				linctr;
+	SystemEmissions	: linctr;
+	EmissionsCap	: linctr;
+
+	SystemCosts		: 									linctr;
+
+end-declarations
+
+
+initializations from "mmsheet.xlsx:" + DATASOURCE + SUPPLY_SIDE_WORKBOOK
+	[GEN_INIT_CAPACITY,GEN_MARG_COST,GEN_MARG_EMISSIONS,GEN_INVCOST,GEN_FLEX,GEN_FUEL,GEN_TYPE] as "skiph;power_plant_data(#1,#6,#9,#10,#14,#15,#2,#3)";
+	GEN_PROFILE as "skiph;generator_profile";
+end-initializations
+
+initializations from "mmsheet.xlsx:" + DATASOURCE + DEMAND_WORKBOOK
+	[PERIOD_DURATION,DEMAND] as "skiph;demand(#1,#2,#3)";
+end-initializations
+
+forall(gg in GENERATORS)
+	GEN_NAME(gg) :=  GEN_TYPE(gg) + "(" + GEN_FUEL(gg) + ")";
+	
+!DEMAND :: [1100, 1500, 2500, 1600, 1800, 1200];
+!PERIOD_DURATION:: [5, 4, 3, 4, 3, 5];
+CARBON_CAP	:= 2000000;!1e9;!0;!
+CARBON_PRICE := 0;!33.4309;!
+
+forall(gg in GENERATORS | GEN_INVCOST(gg) + GEN_INIT_CAPACITY(gg) > 0) create(gen_cap(gg));
+forall(gg in GENERATORS, pp in PERIODS | exists(gen_cap(gg))) create(gen_prod(gg,pp));
+
+forall(gg in GENERATORS | GEN_INVCOST(gg) > 0) create(gen_inv(gg));
+
+forall(gg in GENERATORS) do
+	gen_cap(gg) = GEN_INIT_CAPACITY(gg) + gen_inv(gg);
+end-do
+
+forall(gg in GENERATORS, pp in PERIODS | GEN_FLEX(gg)) do
+	GenMaxCapacity(gg,pp) :=
+		gen_prod(gg,pp) <= gen_cap(gg);
+end-do
+
+
+forall(gg in GENERATORS, pp in PERIODS | not GEN_FLEX(gg)) do
+	GenMaxCapacity(gg,pp) :=
+		gen_prod(gg,pp) <= GEN_PROFILE(gg,pp) * gen_cap(gg);
+end-do
+
+
+forall(pp in PERIODS) do
+	DemandBalance(pp) := sum(gg in GENERATORS) gen_prod(gg,pp) >= DEMAND(pp);
+end-do
+
+SystemCosts := sum(gg in GENERATORS) GEN_INVCOST(gg)*gen_inv(gg) + 365 * sum(gg in GENERATORS, pp in PERIODS) PERIOD_DURATION(pp) * GEN_MARG_COST(gg) * gen_prod(gg,pp);
+
+
+SystemEmissions := 365 * sum(gg in GENERATORS, pp in PERIODS) PERIOD_DURATION(pp) * GEN_MARG_EMISSIONS(gg) * gen_prod(gg,pp) <= 1e12;
+
+if USE_EMISSION_CAP then
+	setcoeff(SystemEmissions,-CARBON_CAP);
+end-if
+
+if USE_EMISSION_PRICE then
+	SystemCosts += 365*CARBON_PRICE * sum(gg in GENERATORS, pp in PERIODS) PERIOD_DURATION(pp) * GEN_MARG_EMISSIONS(gg) * gen_prod(gg,pp);
+end-if
+
+
+declarations
+	status:array({XPRS_OPT,XPRS_UNF,XPRS_INF,XPRS_UNB,XPRS_OTH}) of string;
+end-declarations
+
+status::([XPRS_OPT,XPRS_UNF,XPRS_INF,XPRS_UNB,XPRS_OTH])[
+		 "Optimum found","Unfinished","Infeasible","Unbounded","Failed"];
+	
+minimize(SystemCosts);
+
+if getprobstat = XPRS_OPT then
+	
+	TOTAL_SYSTEM_COSTS	:= getsol(SystemCosts);
+	
+	forall(pp in PERIODS) do
+		POWER_PRICES(pp) := getdual(DemandBalance(pp))/PERIOD_DURATION(pp)/365;
+	end-do
+	
+	forall(gg in GENERATORS, pp in PERIODS) do
+		GEN_PROD_SOL(gg,pp) := getsol(gen_prod(gg,pp));
+	end-do	
+
+	TOTAL_SYSTEM_FUEL_COSTS := 365 * sum(gg in GENERATORS, pp in PERIODS) PERIOD_DURATION(pp)* GEN_MARG_COST(gg) * getsol(gen_prod(gg,pp));
+
+	TOTAL_EMISSIONS := getact(SystemEmissions);
+	
+	if false then
+		CARBON_PRICE	:= -1*getdual(SystemEmissions);
+	end-if
+	
+	write_solution_stats(PRINT_STATS);
+	
+end-if
+
+procedure write_solution_stats(PRINT_ON:boolean)
+	if(PRINT_ON) then
+		!-------------------------------------------
+		! System cost and emission results
+		!-------------------------------------------
+		writeln("-"*(17+6*PERIODS.size));
+		write("System cost and emission results\n");
+		writeln("-"*(17+6*PERIODS.size));
+		writeln(strfmt("System costs (Meuro) = ",40) + strfmt(TOTAL_SYSTEM_COSTS/1e6,3,0));
+		writeln(strfmt("System fuel costs (Meuro) = ",40) + strfmt(TOTAL_SYSTEM_FUEL_COSTS/1e6,3,0));
+		writeln(strfmt("System emissions (MtCO2) = ",40) + "  " + strfmt(TOTAL_EMISSIONS/1e6,3,1));
+		writeln(strfmt("System emissions price (euro/tCO2) = ",40) + "  " + strfmt(abs(getdual(SystemEmissions)),3,1));
+		writeln(strfmt("Emission price (euro/tCO2) = ",40) + "  " + strfmt(CARBON_PRICE,3,1));
+		writeln("-"*(17+6*PERIODS.size));
+		write("\n");
+		
+		!-------------------------------------------
+		! Investments
+		!-------------------------------------------
+		writeln("-"*(17+6*PERIODS.size));
+		write("Investment [MW] \n");
+		writeln("-"*(17+6*PERIODS.size));
+		forall(gg in GENERATORS | exists(gen_inv(gg))) do
+			write(strfmt(GEN_NAME(gg),17) + ": " + strfmt(getsol(gen_inv(gg)),5,0) + "\n");
+		end-do
+		writeln("-"*(17+6*PERIODS.size));
+		writeln;
+		
+		!-------------------------------------------
+		! System operation
+		!-------------------------------------------
+		writeln("-"*(17+6*PERIODS.size));
+		! Price
+		write(strfmt("Price [euro/MWh]",17));
+		forall(pp in PERIODS) do
+			write("  " + strfmt(POWER_PRICES(pp),4,1));
+		end-do
+		write("\n");
+		writeln("-"*(17+6*PERIODS.size));
+		! Duration
+		write(strfmt("Duration [h]",17));
+		forall(pp in PERIODS) do
+			write("  " + strfmt(PERIOD_DURATION(pp),4,0));
+		end-do
+		write("\n");
+		
+		writeln("-"*(17+6*PERIODS.size));
+		write(strfmt("Operation [MWh/h] \n",17));
+		! Load
+		write(strfmt("Load",17));
+		forall(pp in PERIODS) do
+			write("  " + strfmt(DEMAND(pp),4,0));
+		end-do
+		write("\n");
+		writeln("-"*(17+6*PERIODS.size));
+		! Period energy mix per generator
+		forall(gg in GENERATORS | exists(gen_cap(gg))) do
+			write(strfmt(GEN_NAME(gg),17)); 
+			forall(pp in PERIODS) do
+				write("  " + strfmt(getsol(gen_prod(gg,pp)),4,0));
+			end-do
+		write("\n");
+		end-do
+		writeln("-"*(17+6*PERIODS.size));
+	end-if
+end-procedure
+
+end-model
